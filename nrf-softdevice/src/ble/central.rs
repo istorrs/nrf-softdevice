@@ -19,6 +19,7 @@ pub enum ConnectError {
     Timeout,
     NoAddresses,
     NoFreeConn,
+    UnexpectedEvent(u32),
     #[cfg(feature = "ble-gatt-client")]
     MtuExchange(MtuExchangeError),
     Raw(RawError),
@@ -109,7 +110,10 @@ where
                     }
                 }
                 raw::BLE_GAP_EVTS_BLE_GAP_EVT_TIMEOUT => Err(ConnectError::Timeout),
-                e => panic!("unexpected event {}", e),
+                e => {
+                    warn!("connect: unexpected event {}", e);
+                    Err(ConnectError::UnexpectedEvent(e))
+                }
             }
         })
         .await?;
@@ -216,6 +220,12 @@ where
                     if let Some(r) = f(params) {
                         return Some(Ok(r));
                     }
+
+                    // Reset len to full capacity before resume: SD writes actual received
+                    // length into BUF_DATA.len after each adv_report, so without this
+                    // reset the buffer would shrink with each call and eventually truncate
+                    // or trigger an SD assertion on a longer advertisement.
+                    BUF_DATA.len = BUF_LEN as u16;
 
                     // Resume scan
                     let ret = raw::sd_ble_gap_scan_start(ptr::null(), ptr::addr_of!(BUF_DATA));
