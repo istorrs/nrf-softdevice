@@ -84,6 +84,10 @@ pub enum DiscoverError {
     ServiceNotFound,
     /// Service with the given UUID found, but it's missing some required characteristics.
     ServiceIncomplete,
+    /// Peer returned more characteristics than `DiscCharsMax` allows.
+    TooManyCharacteristics,
+    /// Peer returned more descriptors than `DiscDescsMax` allows.
+    TooManyDescriptors,
     Gatt(GattError),
     Raw(RawError),
 }
@@ -142,7 +146,10 @@ pub(crate) async fn discover_service(conn: &Connection, uuid: Uuid) -> Result<ra
                         }
                     }
                 }
-                e => panic!("unexpected event {}", e),
+                e => {
+                    warn!("discover_service: unexpected event {:?}", e);
+                    Err(DiscoverError::Disconnected)
+                }
             }
         })
         .await
@@ -179,11 +186,19 @@ async fn discover_characteristics(
                     let gattc_evt = check_status(ble_evt)?;
                     let params = get_union_field(ble_evt, &gattc_evt.params.char_disc_rsp);
                     let v = get_flexarray(ble_evt, &params.chars, params.count as usize);
-                    let v = Vec::from_slice(v)
-                        .unwrap_or_else(|_| panic!("too many gatt chars, increase DiscCharsMax: {:?}", v.len()));
+                    let v = match Vec::from_slice(v) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            warn!("discover_characteristics: too many chars: {:?}", params.count);
+                            return Err(DiscoverError::TooManyCharacteristics);
+                        }
+                    };
                     Ok(v)
                 }
-                e => panic!("unexpected event {}", e),
+                e => {
+                    warn!("discover_characteristics: unexpected event {:?}", e);
+                    Err(DiscoverError::Disconnected)
+                }
             }
         })
         .await
@@ -220,11 +235,19 @@ async fn discover_descriptors(
                     let gattc_evt = check_status(ble_evt)?;
                     let params = get_union_field(ble_evt, &gattc_evt.params.desc_disc_rsp);
                     let v = get_flexarray(ble_evt, &params.descs, params.count as usize);
-                    let v = Vec::from_slice(v)
-                        .unwrap_or_else(|_| panic!("too many gatt descs, increase DiscDescsMax: {:?}", v.len()));
+                    let v = match Vec::from_slice(v) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            warn!("discover_descriptors: too many descs: {:?}", params.count);
+                            return Err(DiscoverError::TooManyDescriptors);
+                        }
+                    };
                     Ok(v)
                 }
-                e => panic!("unexpected event {}", e),
+                e => {
+                    warn!("discover_descriptors: unexpected event {:?}", e);
+                    Err(DiscoverError::Disconnected)
+                }
             }
         })
         .await
