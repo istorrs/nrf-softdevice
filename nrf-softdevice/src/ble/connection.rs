@@ -253,6 +253,11 @@ pub(crate) struct ConnectionState {
 
     #[cfg(feature = "ble-sec")]
     pub security: EncryptionState,
+
+    // Buffer for the peer's LESC P-256 public key, written by the SoftDevice during
+    // LESC pairing.  Lives in the static ConnectionState array so the pointer is stable.
+    #[cfg(feature = "ble-sec")]
+    pub peer_pk: raw::ble_gap_lesc_p256_pk_t,
 }
 
 impl ConnectionState {
@@ -283,6 +288,8 @@ impl ConnectionState {
             data_length_effective: 0,
             #[cfg(feature = "ble-sec")]
             security: NEW_ENCRYPTION_STATE,
+            #[cfg(feature = "ble-sec")]
+            peer_pk: raw::ble_gap_lesc_p256_pk_t { pk: [0u8; 64] },
         }
     }
     pub(crate) fn check_connected(&mut self) -> Result<u16, DisconnectedError> {
@@ -354,7 +361,7 @@ impl ConnectionState {
         trace!("conn {:?}: disconnected", _index);
     }
 
-    pub(crate) fn keyset(&mut self) -> raw::ble_gap_sec_keyset_t {
+    pub(crate) fn keyset(&mut self, lesc: bool) -> raw::ble_gap_sec_keyset_t {
         #[cfg(feature = "ble-sec")]
         return raw::ble_gap_sec_keyset_t {
             keys_own: raw::ble_gap_sec_keys_t {
@@ -367,24 +374,29 @@ impl ConnectionState {
                 p_enc_key: &mut self.security.peer_enc_key,
                 p_id_key: &mut self.security.peer_id,
                 p_sign_key: core::ptr::null_mut(),
-                p_pk: core::ptr::null_mut(),
+                // For LESC the SoftDevice writes the peer's public key into this buffer.
+                // Must be non-null for LESC; must be null for legacy pairing.
+                p_pk: if lesc { &mut self.peer_pk } else { core::ptr::null_mut() },
             },
         };
         #[cfg(not(feature = "ble-sec"))]
-        return raw::ble_gap_sec_keyset_t {
-            keys_own: raw::ble_gap_sec_keys_t {
-                p_enc_key: core::ptr::null_mut(),
-                p_id_key: core::ptr::null_mut(),
-                p_sign_key: core::ptr::null_mut(),
-                p_pk: core::ptr::null_mut(),
-            },
-            keys_peer: raw::ble_gap_sec_keys_t {
-                p_enc_key: core::ptr::null_mut(),
-                p_id_key: core::ptr::null_mut(),
-                p_sign_key: core::ptr::null_mut(),
-                p_pk: core::ptr::null_mut(),
-            },
-        };
+        {
+            let _ = lesc;
+            return raw::ble_gap_sec_keyset_t {
+                keys_own: raw::ble_gap_sec_keys_t {
+                    p_enc_key: core::ptr::null_mut(),
+                    p_id_key: core::ptr::null_mut(),
+                    p_sign_key: core::ptr::null_mut(),
+                    p_pk: core::ptr::null_mut(),
+                },
+                keys_peer: raw::ble_gap_sec_keys_t {
+                    p_enc_key: core::ptr::null_mut(),
+                    p_id_key: core::ptr::null_mut(),
+                    p_sign_key: core::ptr::null_mut(),
+                    p_pk: core::ptr::null_mut(),
+                },
+            };
+        }
     }
 }
 
@@ -489,6 +501,8 @@ impl Connection {
 
                 #[cfg(feature = "ble-sec")]
                 security: NEW_ENCRYPTION_STATE,
+                #[cfg(feature = "ble-sec")]
+                peer_pk: raw::ble_gap_lesc_p256_pk_t { pk: [0u8; 64] },
             };
 
             // Update index_by_handle

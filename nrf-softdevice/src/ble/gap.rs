@@ -2,6 +2,35 @@ use crate::ble::*;
 use crate::util::get_union_field;
 use crate::{raw, RawError};
 
+type LescDhkeyFn = fn(peer_pk: &[u8; 64]) -> Option<[u8; 32]>;
+
+// Safety for both statics: nrf-softdevice targets single-core Cortex-M only.
+// set_lesc_dhkey_fn / set_lesc_own_pk are called from application context before any bonding
+// begins and are never modified again.  The handler reads them from the SoftDevide interrupt.
+// No concurrent write/write or torn-read is possible on this architecture.
+static mut LESC_DHKEY_FN: Option<LescDhkeyFn> = None;
+static mut LESC_OWN_PK_BUF: raw::ble_gap_lesc_p256_pk_t = raw::ble_gap_lesc_p256_pk_t { pk: [0u8; 64] };
+
+/// Register a callback that computes the LESC Diffie-Hellman shared secret.
+/// Called when `BLE_GAP_EVT_LESC_DHKEY_REQUEST` fires.
+/// Receives the peer's P-256 public key as 64 bytes {X, Y} in little-endian.
+/// Returns the 32-byte x-coordinate of the shared secret in little-endian, or `None` to abort.
+///
+/// # Safety
+/// Must be called before the first bonding attempt and not changed afterwards.
+pub unsafe fn set_lesc_dhkey_fn(f: LescDhkeyFn) {
+    LESC_DHKEY_FN = Some(f);
+}
+
+/// Store our LESC P-256 public key (64 bytes, {X_LE, Y_LE}) so it can be supplied as
+/// `keys_own.p_pk` in `sd_ble_gap_sec_params_reply`.  Call before `sd_ble_gap_authenticate`.
+///
+/// # Safety
+/// Must be called before the first bonding attempt and not changed concurrently with bonding.
+pub unsafe fn set_lesc_own_pk(pk_le: [u8; 64]) {
+    LESC_OWN_PK_BUF.pk = pk_le;
+}
+
 pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
     let gap_evt = get_union_field(ble_evt, &(*ble_evt).evt.gap_evt);
     match (*ble_evt).header.evt_id as u32 {
@@ -70,10 +99,20 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
             let params = &gap_evt.params.timeout;
             match params.src as u32 {
                 #[cfg(feature = "ble-central")]
-                raw::BLE_GAP_TIMEOUT_SRC_CONN => central::CONNECT_PORTAL.call(ble_evt),
+                raw::BLE_GAP_TIMEOUT_SRC_CONN => { central::CONNECT_PORTAL.call(ble_evt); }
                 #[cfg(feature = "ble-central")]
-                raw::BLE_GAP_TIMEOUT_SRC_SCAN => central::SCAN_PORTAL.call(ble_evt),
-                x => panic!("unknown timeout src {:?}", x),
+                raw::BLE_GAP_TIMEOUT_SRC_SCAN => { central::SCAN_PORTAL.call(ble_evt); }
+                raw::BLE_GAP_TIMEOUT_SRC_AUTH_PAYLOAD => {
+                    // Authenticated payload timeout on an encrypted connection.
+                    // Disconnect so futures waiting on this connection (e.g. gatt_client::run)
+                    // receive BLE_GAP_EVT_DISCONNECTED and can clean up gracefully.
+                    warn!("auth payload timeout conn_handle={:?}", gap_evt.conn_handle);
+                    raw::sd_ble_gap_disconnect(
+                        gap_evt.conn_handle,
+                        raw::BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION as u8,
+                    );
+                }
+                x => warn!("unknown timeout src {:?}", x),
             };
         }
         #[cfg(feature = "ble-peripheral")]
@@ -172,7 +211,8 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                     peer_params.min_key_size, peer_params.max_key_size);
 
             if let Some(conn) = Connection::from_handle(gap_evt.conn_handle) {
-                let (sec_params, keyset) = conn.with_state(|state| {
+                let peer_lesc = peer_params.lesc() != 0;
+                let (sec_params, is_central, mut keyset) = conn.with_state(|state| {
                     #[cfg(not(feature = "ble-peripheral"))]
                     let sec_params = None;
                     #[cfg(feature = "ble-peripheral")]
@@ -185,18 +225,34 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                             .handler
                             .map(|h| h.security_params(&conn))
                             .unwrap_or_else(default_security_params);
+
+                        // Enable LESC in peripheral reply when we have a DHKey handler registered.
+                        let mut sec_params = sec_params;
+                        if unsafe { LESC_DHKEY_FN.is_some() } {
+                            sec_params.set_lesc(1);
+                        }
                         Some(sec_params)
                     } else {
                         None
                     };
 
-                    (sec_params, state.keyset())
+                    (sec_params, state.role == Role::Central, state.keyset(peer_lesc))
                 });
+
+                // In central role, sd_ble_gap_authenticate already supplied sec_params.
+                let sec_params_ptr = if is_central { core::ptr::null() } else {
+                    sec_params.as_ref().map(|x| x as *const _).unwrap_or(core::ptr::null())
+                };
+
+                // For LESC: keys_own.p_pk must point to our own public key (stable RAM).
+                if peer_lesc {
+                    keyset.keys_own.p_pk = unsafe { &mut LESC_OWN_PK_BUF };
+                }
 
                 let ret = raw::sd_ble_gap_sec_params_reply(
                     gap_evt.conn_handle,
                     raw::BLE_GAP_SEC_STATUS_SUCCESS as u8,
-                    sec_params.as_ref().map(|x| x as *const _).unwrap_or(core::ptr::null()),
+                    sec_params_ptr,
                     &keyset,
                 );
 
@@ -367,8 +423,28 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                 }
             }
         }
+        raw::BLE_GAP_EVTS_BLE_GAP_EVT_LESC_DHKEY_REQUEST => {
+            let params = &gap_evt.params.lesc_dhkey_request;
+            if let Some(dhkey_fn) = unsafe { LESC_DHKEY_FN } {
+                let peer_pk = &(*params.p_pk_peer).pk;
+                match dhkey_fn(peer_pk) {
+                    Some(key) => {
+                        let dhkey = raw::ble_gap_lesc_dhkey_t { key };
+                        raw::sd_ble_gap_lesc_dhkey_reply(gap_evt.conn_handle, &dhkey);
+                    }
+                    None => {
+                        warn!("LESC DHKey computation failed; aborting pairing");
+                        raw::sd_ble_gap_disconnect(
+                            gap_evt.conn_handle,
+                            raw::BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION as u8,
+                        );
+                    }
+                }
+            } else {
+                warn!("LESC_DHKEY_REQUEST with no handler registered");
+            }
+        }
         // BLE_GAP_EVTS_BLE_GAP_EVT_KEY_PRESSED (LESC central pairing)
-        // BLE_GAP_EVTS_BLE_GAP_EVT_LESC_DHKEY_REQUEST (LESC key calculation)
         // BLE_GAP_EVTS_BLE_GAP_EVT_RSSI_CHANGED
         // BLE_GAP_EVTS_BLE_GAP_EVT_SCAN_REQ_REPORT
         // BLE_GAP_EVTS_BLE_GAP_EVT_QOS_CHANNEL_SURVEY_REPORT
