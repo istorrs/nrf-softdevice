@@ -99,9 +99,13 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
             let params = &gap_evt.params.timeout;
             match params.src as u32 {
                 #[cfg(feature = "ble-central")]
-                raw::BLE_GAP_TIMEOUT_SRC_CONN => { central::CONNECT_PORTAL.call(ble_evt); }
+                raw::BLE_GAP_TIMEOUT_SRC_CONN => {
+                    central::CONNECT_PORTAL.call(ble_evt);
+                }
                 #[cfg(feature = "ble-central")]
-                raw::BLE_GAP_TIMEOUT_SRC_SCAN => { central::SCAN_PORTAL.call(ble_evt); }
+                raw::BLE_GAP_TIMEOUT_SRC_SCAN => {
+                    central::SCAN_PORTAL.call(ble_evt);
+                }
                 raw::BLE_GAP_TIMEOUT_SRC_AUTH_PAYLOAD => {
                     // Authenticated payload timeout on an encrypted connection.
                     // Disconnect so futures waiting on this connection (e.g. gatt_client::run)
@@ -240,7 +244,9 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                 });
 
                 // In central role, sd_ble_gap_authenticate already supplied sec_params.
-                let sec_params_ptr = if is_central { core::ptr::null() } else {
+                let sec_params_ptr = if is_central {
+                    core::ptr::null()
+                } else {
                     sec_params.as_ref().map(|x| x as *const _).unwrap_or(core::ptr::null())
                 };
 
