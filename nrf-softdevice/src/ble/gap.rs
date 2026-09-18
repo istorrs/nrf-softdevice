@@ -240,7 +240,16 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                         None
                     };
 
-                    (sec_params, state.role == Role::Central, state.keyset(peer_lesc))
+                    // Same pattern as sec_params above: state.role == Role::Central is
+                    // unconditionally false whenever Role::Central doesn't exist, but
+                    // the variant itself is cfg-gated at its definition, so the
+                    // comparison won't even compile without ble-central.
+                    #[cfg(not(feature = "ble-central"))]
+                    let is_central = false;
+                    #[cfg(feature = "ble-central")]
+                    let is_central = state.role == Role::Central;
+
+                    (sec_params, is_central, state.keyset(peer_lesc))
                 });
 
                 // In central role, sd_ble_gap_authenticate already supplied sec_params.
