@@ -232,7 +232,7 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
 
                         // Enable LESC in peripheral reply when we have a DHKey handler registered.
                         let mut sec_params = sec_params;
-                        if unsafe { LESC_DHKEY_FN.is_some() } {
+                        if unsafe { (*&raw const LESC_DHKEY_FN).is_some() } {
                             sec_params.set_lesc(1);
                         }
                         Some(sec_params)
@@ -252,7 +252,7 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
 
                 // For LESC: keys_own.p_pk must point to our own public key (stable RAM).
                 if peer_lesc {
-                    keyset.keys_own.p_pk = unsafe { &mut LESC_OWN_PK_BUF };
+                    keyset.keys_own.p_pk = &raw mut LESC_OWN_PK_BUF;
                 }
 
                 let ret = raw::sd_ble_gap_sec_params_reply(
