@@ -390,10 +390,13 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                             // peer_enc_key for a LESC bond gets an empty key -- nothing
                             // was ever distributed to put there -- while the real LTK
                             // sits unread in own_enc_key.
-                            let lesc = params.lesc() != 0;
                             let enc_key = match state.role {
+                                // Inlined rather than bound above: a `ble-peripheral`-only
+                                // build compiles this arm out entirely, and a separate
+                                // `let lesc = ...` would then sit unused with warnings
+                                // denied as errors.
                                 #[cfg(feature = "ble-central")]
-                                Role::Central if lesc => &state.security.own_enc_key,
+                                Role::Central if params.lesc() != 0 => &state.security.own_enc_key,
                                 #[cfg(feature = "ble-central")]
                                 Role::Central => &state.security.peer_enc_key,
                                 #[cfg(feature = "ble-peripheral")]
