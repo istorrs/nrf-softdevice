@@ -114,6 +114,7 @@ impl From<DisconnectedError> for DataLengthUpdateError {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum PhyUpdateError {
     Disconnected,
     Raw(RawError),
