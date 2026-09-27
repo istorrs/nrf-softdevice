@@ -1,8 +1,73 @@
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
+
 use crate::ble::*;
 use crate::util::get_union_field;
 use crate::{raw, RawError};
 
 type LescDhkeyFn = fn(peer_pk: &[u8; 64]) -> Option<[u8; 32]>;
+
+// PHY update observability. Both `BLE_GAP_EVT_PHY_UPDATE_REQUEST` and
+// `BLE_GAP_EVT_PHY_UPDATE` fire from this module's `on_evt`, which runs in
+// the SoftDevice's own event-processing context -- not the application task
+// that owns a connection's `Terminal`/UART, so there is no way to log or act
+// on these from application code without some cross-context handoff. A
+// lock-free one-shot flag pair (set here, consumed by `take_*` below) avoids
+// any lock or blocking call from this context, matching how every other
+// SoftDevice-callback-to-application handoff in this crate's consumer works.
+//
+// One-shot: each `take_*` clears the flag it reads. A second event of the
+// same kind arriving before the first is consumed overwrites the recorded
+// fields with no queue -- acceptable here since these are diagnostic, not
+// data that must not be dropped, and a PHY renegotiation is a rare event to
+// begin with.
+static PHY_UPDATE_REQUEST_PENDING: AtomicBool = AtomicBool::new(false);
+static PHY_UPDATE_REQUEST_CONN: AtomicU16 = AtomicU16::new(0);
+static PHY_UPDATE_REQUEST_RX: AtomicU8 = AtomicU8::new(0);
+static PHY_UPDATE_REQUEST_TX: AtomicU8 = AtomicU8::new(0);
+
+static PHY_UPDATE_PENDING: AtomicBool = AtomicBool::new(false);
+static PHY_UPDATE_CONN: AtomicU16 = AtomicU16::new(0);
+static PHY_UPDATE_STATUS: AtomicU8 = AtomicU8::new(0);
+static PHY_UPDATE_RX: AtomicU8 = AtomicU8::new(0);
+static PHY_UPDATE_TX: AtomicU8 = AtomicU8::new(0);
+
+/// Consume the most recent peer-initiated PHY update request, if one arrived
+/// since the last call, as `(conn_handle, rx_phys, tx_phys)` raw
+/// `BLE_GAP_PHYS` bitmasks. By the time this is observable the SoftDevice has
+/// already auto-accepted the request by echoing the peer's preferred masks
+/// straight back (see the `BLE_GAP_EVT_PHY_UPDATE_REQUEST` arm below) --
+/// there is currently no application hook to reject one. This function is
+/// purely so the fact that a request happened, and what it asked for, isn't
+/// silently invisible to application code.
+pub fn take_phy_update_request() -> Option<(u16, u8, u8)> {
+    if PHY_UPDATE_REQUEST_PENDING.swap(false, Ordering::Relaxed) {
+        Some((
+            PHY_UPDATE_REQUEST_CONN.load(Ordering::Relaxed),
+            PHY_UPDATE_REQUEST_RX.load(Ordering::Relaxed),
+            PHY_UPDATE_REQUEST_TX.load(Ordering::Relaxed),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Consume the most recent PHY update completion, if one arrived since the
+/// last call, as `(conn_handle, status, rx_phy, tx_phy)`. Fires regardless of
+/// which side initiated the change. `status` is the raw GAP/HCI status byte
+/// (0 = success); `rx_phy`/`tx_phy` are single-bit `BLE_GAP_PHYS` values, not
+/// the request's preference masks.
+pub fn take_phy_update() -> Option<(u16, u8, u8, u8)> {
+    if PHY_UPDATE_PENDING.swap(false, Ordering::Relaxed) {
+        Some((
+            PHY_UPDATE_CONN.load(Ordering::Relaxed),
+            PHY_UPDATE_STATUS.load(Ordering::Relaxed),
+            PHY_UPDATE_RX.load(Ordering::Relaxed),
+            PHY_UPDATE_TX.load(Ordering::Relaxed),
+        ))
+    } else {
+        None
+    }
+}
 
 // Safety for both statics: nrf-softdevice targets single-core Cortex-M only.
 // set_lesc_dhkey_fn / set_lesc_own_pk are called from application context before any bonding
@@ -140,6 +205,11 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                 peer_preferred_phys.tx_phys
             );
 
+            PHY_UPDATE_REQUEST_CONN.store(conn_handle, Ordering::Relaxed);
+            PHY_UPDATE_REQUEST_RX.store(peer_preferred_phys.rx_phys, Ordering::Relaxed);
+            PHY_UPDATE_REQUEST_TX.store(peer_preferred_phys.tx_phys, Ordering::Relaxed);
+            PHY_UPDATE_REQUEST_PENDING.store(true, Ordering::Relaxed);
+
             let phys = raw::ble_gap_phys_t {
                 rx_phys: peer_preferred_phys.rx_phys,
                 tx_phys: peer_preferred_phys.tx_phys,
@@ -152,15 +222,21 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
             }
         }
         raw::BLE_GAP_EVTS_BLE_GAP_EVT_PHY_UPDATE => {
-            let _phy_update = gap_evt.params.phy_update;
+            let phy_update = gap_evt.params.phy_update;
 
             trace!(
                 "on_phy_update conn_handle={:?} status={:?} rx_phy={:?} tx_phy={:?}",
                 gap_evt.conn_handle,
-                _phy_update.status,
-                _phy_update.rx_phy,
-                _phy_update.tx_phy
+                phy_update.status,
+                phy_update.rx_phy,
+                phy_update.tx_phy
             );
+
+            PHY_UPDATE_CONN.store(gap_evt.conn_handle, Ordering::Relaxed);
+            PHY_UPDATE_STATUS.store(phy_update.status, Ordering::Relaxed);
+            PHY_UPDATE_RX.store(phy_update.rx_phy, Ordering::Relaxed);
+            PHY_UPDATE_TX.store(phy_update.tx_phy, Ordering::Relaxed);
+            PHY_UPDATE_PENDING.store(true, Ordering::Relaxed);
         }
         #[cfg(any(feature = "s113", feature = "s132", feature = "s140"))]
         raw::BLE_GAP_EVTS_BLE_GAP_EVT_DATA_LENGTH_UPDATE_REQUEST => {
