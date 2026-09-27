@@ -69,6 +69,67 @@ pub fn take_phy_update() -> Option<(u16, u8, u8, u8)> {
     }
 }
 
+// Link Layer Data Length Update observability -- same reasoning and pattern
+// as the PHY-update flags above. `ConnectionState.data_length_effective`
+// already exists internally (set from `BLE_GAP_EVT_DATA_LENGTH_UPDATE`,
+// `connection.rs`), but only keeps `max_tx_octets` truncated to `u8`, and
+// there is no public accessor for it at all -- application code cannot read
+// it, and what it could read would already have thrown away rx_octets and
+// both timing fields. These flags carry the full four-field
+// `ble_gap_data_length_params_t` for both the request and the completion.
+static DLE_REQUEST_PENDING: AtomicBool = AtomicBool::new(false);
+static DLE_REQUEST_CONN: AtomicU16 = AtomicU16::new(0);
+static DLE_REQUEST_TX_OCTETS: AtomicU16 = AtomicU16::new(0);
+static DLE_REQUEST_RX_OCTETS: AtomicU16 = AtomicU16::new(0);
+static DLE_REQUEST_TX_TIME_US: AtomicU16 = AtomicU16::new(0);
+static DLE_REQUEST_RX_TIME_US: AtomicU16 = AtomicU16::new(0);
+
+static DLE_UPDATE_PENDING: AtomicBool = AtomicBool::new(false);
+static DLE_UPDATE_CONN: AtomicU16 = AtomicU16::new(0);
+static DLE_UPDATE_TX_OCTETS: AtomicU16 = AtomicU16::new(0);
+static DLE_UPDATE_RX_OCTETS: AtomicU16 = AtomicU16::new(0);
+static DLE_UPDATE_TX_TIME_US: AtomicU16 = AtomicU16::new(0);
+static DLE_UPDATE_RX_TIME_US: AtomicU16 = AtomicU16::new(0);
+
+/// Consume the most recent peer-initiated Data Length Update request, if one
+/// arrived since the last call, as `(conn_handle, tx_octets, rx_octets,
+/// tx_time_us, rx_time_us)` -- the peer's requested Link Layer PDU
+/// parameters. By the time this is observable the SoftDevice has already
+/// auto-accepted it with `data_length_update(None)` (see the
+/// `BLE_GAP_EVT_DATA_LENGTH_UPDATE_REQUEST` arm below); this is purely so
+/// the request and what it asked for isn't silently invisible.
+pub fn take_data_length_update_request() -> Option<(u16, u16, u16, u16, u16)> {
+    if DLE_REQUEST_PENDING.swap(false, Ordering::Relaxed) {
+        Some((
+            DLE_REQUEST_CONN.load(Ordering::Relaxed),
+            DLE_REQUEST_TX_OCTETS.load(Ordering::Relaxed),
+            DLE_REQUEST_RX_OCTETS.load(Ordering::Relaxed),
+            DLE_REQUEST_TX_TIME_US.load(Ordering::Relaxed),
+            DLE_REQUEST_RX_TIME_US.load(Ordering::Relaxed),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Consume the most recent Data Length Update completion, if one arrived
+/// since the last call, as `(conn_handle, tx_octets, rx_octets, tx_time_us,
+/// rx_time_us)` -- the negotiated *effective* Link Layer PDU parameters now
+/// in force. Fires regardless of which side initiated the change.
+pub fn take_data_length_update() -> Option<(u16, u16, u16, u16, u16)> {
+    if DLE_UPDATE_PENDING.swap(false, Ordering::Relaxed) {
+        Some((
+            DLE_UPDATE_CONN.load(Ordering::Relaxed),
+            DLE_UPDATE_TX_OCTETS.load(Ordering::Relaxed),
+            DLE_UPDATE_RX_OCTETS.load(Ordering::Relaxed),
+            DLE_UPDATE_TX_TIME_US.load(Ordering::Relaxed),
+            DLE_UPDATE_RX_TIME_US.load(Ordering::Relaxed),
+        ))
+    } else {
+        None
+    }
+}
+
 // Safety for both statics: nrf-softdevice targets single-core Cortex-M only.
 // set_lesc_dhkey_fn / set_lesc_own_pk are called from application context before any bonding
 // begins and are never modified again.  The handler reads them from the SoftDevide interrupt.
@@ -240,16 +301,23 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
         }
         #[cfg(any(feature = "s113", feature = "s132", feature = "s140"))]
         raw::BLE_GAP_EVTS_BLE_GAP_EVT_DATA_LENGTH_UPDATE_REQUEST => {
-            let _peer_params = gap_evt.params.data_length_update_request.peer_params;
+            let peer_params = gap_evt.params.data_length_update_request.peer_params;
 
             trace!(
                 "on_data_length_update_request conn_handle={:?} max_rx_octets={:?} max_rx_time_us={:?} max_tx_octets={:?} max_tx_time_us={:?}",
                 gap_evt.conn_handle,
-                _peer_params.max_rx_octets,
-                _peer_params.max_rx_time_us,
-                _peer_params.max_tx_octets,
-                _peer_params.max_tx_time_us,
+                peer_params.max_rx_octets,
+                peer_params.max_rx_time_us,
+                peer_params.max_tx_octets,
+                peer_params.max_tx_time_us,
             );
+
+            DLE_REQUEST_CONN.store(gap_evt.conn_handle, Ordering::Relaxed);
+            DLE_REQUEST_TX_OCTETS.store(peer_params.max_tx_octets, Ordering::Relaxed);
+            DLE_REQUEST_RX_OCTETS.store(peer_params.max_rx_octets, Ordering::Relaxed);
+            DLE_REQUEST_TX_TIME_US.store(peer_params.max_tx_time_us, Ordering::Relaxed);
+            DLE_REQUEST_RX_TIME_US.store(peer_params.max_rx_time_us, Ordering::Relaxed);
+            DLE_REQUEST_PENDING.store(true, Ordering::Relaxed);
 
             let conn_handle = gap_evt.conn_handle;
             if let Some(mut conn) = Connection::from_handle(conn_handle) {
@@ -263,6 +331,13 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
             connection::with_state_by_conn_handle(gap_evt.conn_handle, |state| {
                 state.data_length_effective = effective_params.max_tx_octets as u8;
             });
+
+            DLE_UPDATE_CONN.store(gap_evt.conn_handle, Ordering::Relaxed);
+            DLE_UPDATE_TX_OCTETS.store(effective_params.max_tx_octets, Ordering::Relaxed);
+            DLE_UPDATE_RX_OCTETS.store(effective_params.max_rx_octets, Ordering::Relaxed);
+            DLE_UPDATE_TX_TIME_US.store(effective_params.max_tx_time_us, Ordering::Relaxed);
+            DLE_UPDATE_RX_TIME_US.store(effective_params.max_rx_time_us, Ordering::Relaxed);
+            DLE_UPDATE_PENDING.store(true, Ordering::Relaxed);
 
             debug!(
                 "on_data_length_update conn_handle={:?} max_rx_octets={:?} max_rx_time_us={:?} max_tx_octets={:?} max_tx_time_us={:?}",
